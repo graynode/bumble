@@ -110,13 +110,17 @@ async def open_usb_transport(spec: str) -> Transport:
     READ_SIZE = 4096
 
     class UsbPacketSink:
-        def __init__(self, device, acl_out):
+        def __init__(self, device, acl_out, iso_out=None):
             self.device = device
             self.acl_out = acl_out
+            self.loop = asyncio.get_running_loop()
             self.acl_out_transfer = device.getTransfer()
             self.acl_out_transfer_ready = asyncio.Semaphore(1)
+            self.iso_out = iso_out
+            self.iso_out_transfer = device.getTransfer() if iso_out is not None else None
+            self.iso_out_transfer_ready = asyncio.Semaphore(1) if iso_out is not None else None
+            self.iso_cancel_done = self.loop.create_future() if iso_out is not None else None
             self.packets = asyncio.Queue[bytes]()  # Queue of packets waiting to be sent
-            self.loop = asyncio.get_running_loop()
             self.queue_task = None
             self.cancel_done = self.loop.create_future()
             self.closed = False
@@ -153,6 +157,18 @@ async def open_usb_transport(spec: str) -> Transport:
                     )
                 )
 
+        def _iso_transfer_callback(self, transfer):
+            self.loop.call_soon_threadsafe(self.iso_out_transfer_ready.release)
+            status = transfer.getStatus()
+            # pylint: disable=no-member
+            if status == usb1.TRANSFER_CANCELLED:
+                self.loop.call_soon_threadsafe(self.iso_cancel_done.set_result, None)
+                return
+            if status != usb1.TRANSFER_COMPLETED:
+                logger.warning(
+                    color(f'!!! ISO OUT transfer not completed: status={status}', 'red')
+                )
+
         async def process_queue(self):
             while True:
                 # Wait for a packet to transfer.
@@ -178,6 +194,23 @@ async def open_usb_transport(spec: str) -> Transport:
                         callback=self.transfer_callback,
                     )
                     self.acl_out_transfer.submit()
+                elif packet_type == hci.HCI_ISO_DATA_PACKET:
+                    if self.iso_out is not None:
+                        # We're using the dedicated ISO endpoint, not the ACL endpoint,
+                        # so release the ACL semaphore we acquired above and use the
+                        # ISO-specific semaphore instead.
+                        self.acl_out_transfer_ready.release()
+                        await self.iso_out_transfer_ready.acquire()
+                        self.iso_out_transfer.setBulk(
+                            self.iso_out, packet[1:], callback=self._iso_transfer_callback
+                        )
+                        self.iso_out_transfer.submit()
+                    else:
+                        # Fall back to ACL bulk OUT if no dedicated ISO endpoint
+                        self.acl_out_transfer.setBulk(
+                            self.acl_out, packet[1:], callback=self.transfer_callback
+                        )
+                        self.acl_out_transfer.submit()
                 else:
                     logger.warning(
                         color(f'unsupported packet type {packet_type}', 'red')
@@ -209,8 +242,15 @@ async def open_usb_transport(spec: str) -> Transport:
                 except usb1.USBError:
                     logger.debug('OUT transfer likely already completed')
 
+            if self.iso_out_transfer is not None and self.iso_out_transfer.isSubmitted():
+                try:
+                    self.iso_out_transfer.cancel()
+                    await self.iso_cancel_done
+                except usb1.USBError:
+                    logger.debug('ISO OUT transfer likely already completed')
+
     class UsbPacketSource(asyncio.Protocol, BaseSource):
-        def __init__(self, device, metadata, acl_in, events_in):
+        def __init__(self, device, metadata, acl_in, events_in, iso_in=None):
             super().__init__()
             self.device = device
             self.metadata = metadata
@@ -218,6 +258,8 @@ async def open_usb_transport(spec: str) -> Transport:
             self.acl_in_transfer = None
             self.events_in = events_in
             self.events_in_transfer = None
+            self.iso_in = iso_in
+            self.iso_in_transfer = None
             self.loop = asyncio.get_running_loop()
             self.queue = asyncio.Queue()
             self.dequeue_task = None
@@ -225,6 +267,8 @@ async def open_usb_transport(spec: str) -> Transport:
                 hci.HCI_EVENT_PACKET: self.loop.create_future(),
                 hci.HCI_ACL_DATA_PACKET: self.loop.create_future(),
             }
+            if iso_in is not None:
+                self.cancel_done[hci.HCI_ISO_DATA_PACKET] = self.loop.create_future()
             self.closed = False
 
         def start(self):
@@ -247,6 +291,16 @@ async def open_usb_transport(spec: str) -> Transport:
             )
             self.acl_in_transfer.submit()
 
+            if self.iso_in is not None:
+                self.iso_in_transfer = device.getTransfer()
+                self.iso_in_transfer.setBulk(
+                    self.iso_in,
+                    READ_SIZE,
+                    callback=self.transfer_callback,
+                    user_data=hci.HCI_ISO_DATA_PACKET,
+                )
+                self.iso_in_transfer.submit()
+
             self.dequeue_task = self.loop.create_task(self.dequeue())
 
         @property
@@ -254,6 +308,10 @@ async def open_usb_transport(spec: str) -> Transport:
             return (
                 self.events_in_transfer.isSubmitted()
                 or self.acl_in_transfer.isSubmitted()
+                or (
+                    self.iso_in_transfer is not None
+                    and self.iso_in_transfer.isSubmitted()
+                )
             )
 
         def transfer_callback(self, transfer):
@@ -307,7 +365,10 @@ async def open_usb_transport(spec: str) -> Transport:
             self.dequeue_task.cancel()
 
             # Cancel the transfers
-            for transfer in (self.events_in_transfer, self.acl_in_transfer):
+            transfers = [self.events_in_transfer, self.acl_in_transfer]
+            if self.iso_in_transfer is not None:
+                transfers.append(self.iso_in_transfer)
+            for transfer in transfers:
                 if transfer.isSubmitted():
                     # Try to cancel the transfer, but that may fail because it may have
                     # already completed
@@ -483,14 +544,20 @@ async def open_usb_transport(spec: str) -> Transport:
                         events_in = None
                         acl_in = None
                         acl_out = None
+                        iso_in = None
+                        iso_out = None
                         for endpoint in setting:
                             attributes = endpoint.getAttributes()
                             address = endpoint.getAddress()
                             if attributes & 0x03 == USB_ENDPOINT_TRANSFER_TYPE_BULK:
                                 if address & USB_ENDPOINT_IN and acl_in is None:
                                     acl_in = address
-                                elif acl_out is None:
+                                elif address & USB_ENDPOINT_IN and iso_in is None:
+                                    iso_in = address
+                                elif not (address & USB_ENDPOINT_IN) and acl_out is None:
                                     acl_out = address
+                                elif not (address & USB_ENDPOINT_IN) and iso_out is None:
+                                    iso_out = address
                             elif (
                                 attributes & 0x03
                                 == USB_ENDPOINT_TRANSFER_TYPE_INTERRUPT
@@ -498,7 +565,7 @@ async def open_usb_transport(spec: str) -> Transport:
                                 if address & USB_ENDPOINT_IN and events_in is None:
                                     events_in = address
 
-                        # Return if we found all 3 endpoints
+                        # Return if we found all 3 required endpoints
                         if (
                             acl_in is not None
                             and acl_out is not None
@@ -511,6 +578,8 @@ async def open_usb_transport(spec: str) -> Transport:
                                 acl_in,
                                 acl_out,
                                 events_in,
+                                iso_in,
+                                iso_out,
                             )
 
                         logger.debug(
@@ -523,14 +592,16 @@ async def open_usb_transport(spec: str) -> Transport:
         endpoints = find_endpoints(found)
         if endpoints is None:
             raise TransportInitError('no compatible interface found for device')
-        (configuration, interface, setting, acl_in, acl_out, events_in) = endpoints
+        (configuration, interface, setting, acl_in, acl_out, events_in, iso_in, iso_out) = endpoints
         logger.debug(
             f'selected endpoints: configuration={configuration}, '
             f'interface={interface}, '
             f'setting={setting}, '
             f'acl_in=0x{acl_in:02X}, '
             f'acl_out=0x{acl_out:02X}, '
-            f'events_in=0x{events_in:02X}, '
+            f'events_in=0x{events_in:02X}'
+            + (f', iso_in=0x{iso_in:02X}' if iso_in is not None else '')
+            + (f', iso_out=0x{iso_out:02X}' if iso_out is not None else '')
         )
 
         device_metadata = {
@@ -562,8 +633,8 @@ async def open_usb_transport(spec: str) -> Transport:
             except usb1.USBError:
                 logger.warning('failed to set configuration')
 
-        source = UsbPacketSource(device, device_metadata, acl_in, events_in)
-        sink = UsbPacketSink(device, acl_out)
+        source = UsbPacketSource(device, device_metadata, acl_in, events_in, iso_in)
+        sink = UsbPacketSink(device, acl_out, iso_out)
         return UsbTransport(context, device, interface, setting, source, sink)
     except usb1.USBError as error:
         logger.warning(color(f'!!! failed to open USB device: {error}', 'red'))
